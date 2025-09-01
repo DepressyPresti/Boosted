@@ -1,0 +1,39 @@
+# Boosted - Configuration
+# Define your boosts under the 'boosts' section.
+# Each boost applies a LuckPerms group and can run an arbitrary list of start/end commands.
+#
+# Placeholders available in messages/commands:
+#  %player%        - player name
+#  %player_uuid%   - player UUID
+#  %boost_name%    - the configured boost key
+#  %duration%      - the raw duration string (e.g., 1h30m)
+#
+# Color codes: use '&' (e.g., &a, &e, &c).
+# Messages are broadcast globally when a boost starts/ends.
+#
+# LuckPerms is expected to be installed. We use console commands to add a *temporary* parent:
+#   lp user <uuid> parent addtemp <group> <duration> accumulate
+# At end, we also try removing the parent just in case:
+#   lp user <uuid> parent remove <group>
+#
+# NOTE: End commands and messages still run even if the server restarts mid-boost.
+#       Boosts persist to data/active_boosts.yml and are resumed on startup.
+#
+boosts:
+  vip:
+    group: "vip"
+    global_start_message: "&a%player% activated &e%boost_name% &afor &e%duration%&a!"
+    global_end_message: "&c%player%'s &e%boost_name% &chas ended."
+    commands:
+      - start: "say Enjoy your VIP boost, %player%!"
+        end: "say %player%'s VIP session is over."
+      - start: "eco give %player% 100"
+        end: "say %player% spent their VIP time wisely."
+  mcmmo2x:
+    group: "mcmmo_boost"
+    global_start_message: "&b%player% started &e%boost_name% &bfor &e%duration%&b!"
+    global_end_message: "&7The &e%boost_name% &7for &e%player% &7has expired."
+    commands:
+      - start: "mmoxp multiplier add %player% 2 %duration%"
+        end: "mmoxp multiplier remove %player% 2"
+# End of config
