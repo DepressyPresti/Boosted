@@ -6,13 +6,17 @@ import com.depressy.boosted.model.BoostDefinition;
 import com.depressy.boosted.util.DurationParser;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
-import org.bukkit.command.*;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 
+import java.lang.reflect.Method;
 import java.util.*;
-import java.util.stream.Collectors;
 
-public class BoostCommand implements TabExecutor {
+public class BoostCommand implements CommandExecutor, TabCompleter {
 
     private final BoostedPlugin plugin;
 
@@ -20,124 +24,170 @@ public class BoostCommand implements TabExecutor {
         this.plugin = plugin;
     }
 
+    private String color(String s) {
+        return ChatColor.translateAlternateColorCodes('&', s);
+    }
+
+    private String getPerBoostStartMessage(BoostDefinition def) {
+        // Prefer model getter if present
+        try {
+            Method m = def.getClass().getMethod("getGlobalStartMessage");
+            Object o = m.invoke(def);
+            if (o != null) return String.valueOf(o);
+        } catch (Throwable ignored) {}
+        // Fallback to config
+        String path = "boosts." + def.getName() + ".global_start_message";
+        return plugin.getConfig().getString(path, "");
+    }
+
+    private String replaceBothPlaceholders(String msg, String activator, String boostName, String duration, String targetName) {
+        if (msg == null) return "";
+        // legacy %...%:
+        msg = msg.replace("%player%", activator)
+                .replace("%boost_name%", boostName)
+                .replace("%duration%", duration);
+        if (targetName != null) msg = msg.replace("%target%", targetName);
+        // new {...}:
+        msg = msg.replace("{player}", activator)
+                .replace("{boost}", boostName)
+                .replace("{time}", duration);
+        if (targetName != null) msg = msg.replace("{target}", targetName);
+        return msg;
+    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
-            if (!sender.hasPermission("boosted.admin")) {
-                sender.sendMessage(color("&cYou don't have permission."));
-                return true;
-            }
-            plugin.reloadBoostedConfig();
-            sender.sendMessage(color("&aBoosted config reloaded."));
+        if (!sender.hasPermission("boosted.boost")) {
+            sender.sendMessage(color("&cYou don't have permission to use this command."));
             return true;
         }
 
-        if (!sender.hasPermission("boosted.admin")) {
-            sender.sendMessage(color("&cYou don't have permission."));
-            return true;
-        }
         if (args.length < 3) {
-            sender.sendMessage(color("&eUsage: /boost <player|@s|@a> <boostName> <duration>"));
+            sender.sendMessage(color("&eUsage: &7/boost <@all|player> <boostName> <duration>"));
             return true;
         }
 
         String target = args[0];
-        String boostName = args[1].toLowerCase();
-        String durationRaw = String.join("", Arrays.copyOfRange(args, 2, args.length)); // allow spaces if user wrote "1h 30m"
+        String boostName = args[1].toLowerCase(Locale.ROOT);
+        String durationRaw = args[2];
 
-        if (DurationParser.parseToMillis(durationRaw) <= 0) {
+        Map<String, BoostDefinition> defs = plugin.getBoostDefinitions();
+        if (!defs.containsKey(boostName)) {
+            sender.sendMessage(color("&cUnknown boost: &e" + boostName));
+            return true;
+        }
+        BoostDefinition def = defs.get(boostName);
+
+        long ms = DurationParser.parseToMillis(durationRaw);
+        if (ms <= 0) {
             sender.sendMessage(color("&cInvalid duration: &e" + durationRaw));
             return true;
         }
 
-        BoostDefinition def = plugin.getBoostDefinitions().get(boostName);
-        if (def == null) {
-            sender.sendMessage(color("&cUnknown boost: &e" + boostName));
-            return true;
-        }
-
         List<Player> targets = new ArrayList<>();
-        if (target.equalsIgnoreCase("@all")) {
-            // All known players: online (respect bypass) + offline (no bypass check)
-            java.util.Set<java.util.UUID> seen = new java.util.HashSet<>();
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                if (!p.hasPermission("boosted.bypass")) {
-                    targets.add(p);
-                    seen.add(p.getUniqueId());
-                }
-            }
-            for (org.bukkit.OfflinePlayer off : Bukkit.getOfflinePlayers()) {
-                if (off.getUniqueId() == null) continue;
-                if (seen.contains(off.getUniqueId())) continue; // skip online already added
-                // schedule for offline directly via manager
-                plugin.getActiveBoostManager().startBoostOffline(off, def, durationRaw);
-            }
-        } else if (target.equalsIgnoreCase("@a")) {
+        boolean isAll = target.equalsIgnoreCase("@all") || target.equalsIgnoreCase("@a");
+        if (isAll) {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 if (!p.hasPermission("boosted.bypass")) targets.add(p);
             }
-        } else if (target.equalsIgnoreCase("@s")) {
-            if (!(sender instanceof Player)) {
-                sender.sendMessage(color("&c@s can only be used by a player."));
-                return true;
-            }
-            Player p = (Player) sender;
-            if (p.hasPermission("boosted.bypass")) {
-                sender.sendMessage(color("&eYou have &6boosted.bypass&e; not applying boost."));
-                return true;
-            }
-            targets.add(p);
+        } else if (target.equalsIgnoreCase("@s") && sender instanceof Player) {
+            targets.add((Player) sender);
         } else {
             Player p = Bukkit.getPlayerExact(target);
-            if (p == null) {
-                sender.sendMessage(color("&cPlayer not found or not online: &e" + target));
-                return true;
+            if (p != null) {
+                targets.add(p);
+            } else {
+                // try offline
+                OfflinePlayer off = Bukkit.getOfflinePlayer(target);
+                if (off != null && off.hasPlayedBefore()) {
+                    plugin.getActiveBoostManager().startBoostOffline(off, def, durationRaw);
+                    sender.sendMessage(color("&aQueued offline boost for &e" + off.getName() + "&a."));
+                } else {
+                    sender.sendMessage(color("&cPlayer not found: &e" + target));
+                }
             }
-            if (p.hasPermission("boosted.bypass")) {
-                sender.sendMessage(color("&e" + p.getName() + " has &6boosted.bypass&e; not applying boost."));
-                return true;
-            }
-            targets.add(p);
         }
 
         ActiveBoostManager mgr = plugin.getActiveBoostManager();
-        int before = mgr.countActiveFor(def.getName());
+
+        // if @all, also queue offline players (unique, not currently online)
+        if (isAll) {
+            HashSet<UUID> seen = new HashSet<>();
+            for (Player pSeen : targets) seen.add(pSeen.getUniqueId());
+            for (OfflinePlayer off : Bukkit.getOfflinePlayers()) {
+                try {
+                    if (off == null || off.getUniqueId() == null) continue;
+                    if (seen.contains(off.getUniqueId())) continue; // already boosted online
+                    if (!off.hasPlayedBefore()) continue;
+                    mgr.startBoostOffline(off, def, durationRaw); // bypass handled inside
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        // boost online targets now
         for (Player p : targets) {
             mgr.startBoost(p, def, durationRaw);
         }
-        int after = mgr.countActiveFor(def.getName());
-        int delta = Math.max(0, after - before);
-        sender.sendMessage(color("&aStarted &e" + def.getName() + " &afor &e" + delta + " &aplayer(s) for &e" + durationRaw + "&a."));
+
+        // single broadcast (not per player)
+        String activator = (sender instanceof Player) ? ((Player) sender).getName() : "Console";
+        String perBoostStart = getPerBoostStartMessage(def);
+
+        if (isAll) {
+            String msg;
+            if (perBoostStart != null && !perBoostStart.isEmpty()) {
+                msg = replaceBothPlaceholders(perBoostStart, activator, def.getName(), durationRaw, null);
+                for (String line : msg.split("\\n")) Bukkit.broadcastMessage(color(line));
+            } else {
+                msg = plugin.getConfig().getString("messages.broadcast_all_start",
+                        "&a{player} &7has boosted &6everyone &7with &e{boost} &7for &b{time}&7!\n&7Make sure to thank them!");
+                msg = replaceBothPlaceholders(msg, activator, def.getName(), durationRaw, null);
+                for (String line : msg.split("\\n")) Bukkit.broadcastMessage(color(line));
+            }
+        } else if (!targets.isEmpty()) {
+            String tName = (targets.size() == 1 ? targets.get(0).getName() : target);
+            String msg;
+            if (perBoostStart != null && !perBoostStart.isEmpty()) {
+                msg = replaceBothPlaceholders(perBoostStart, activator, def.getName(), durationRaw, tName);
+                Bukkit.broadcastMessage(color(msg));
+            } else {
+                msg = plugin.getConfig().getString("messages.broadcast_single_start",
+                        "&a{player} &7boosted &e{target} &7with &6{boost} &7for &b{time}&7!");
+                msg = replaceBothPlaceholders(msg, activator, def.getName(), durationRaw, tName);
+                Bukkit.broadcastMessage(color(msg));
+            }
+        }
+
+        sender.sendMessage(color("&aApplied &6" + def.getName() + " &afor &b" + durationRaw + "&a to &e" + (isAll ? "everyone" : target) + "&a."));
         return true;
     }
 
+    // -------- Tab Complete ----------
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        List<String> out = new ArrayList<>();
         if (args.length == 1) {
-            List<String> base = new ArrayList<>();
-            base.add("@a");
-            base.add("@all");
-            if (sender instanceof Player) base.add("@s");
-            base.addAll(Bukkit.getOnlinePlayers().stream().map(Player::getName).collect(Collectors.toList()));
-            return partial(base, args[0]);
-        } else if (args.length == 2) {
-            return partial(new ArrayList<>(plugin.getBoostDefinitions().keySet()), args[1]);
-        } else if (args.length == 3) {
-            return partial(Arrays.asList("30m","1h","1h30m","2h","1d"), args[2]);
-        } else if (args.length == 1 && "reload".startsWith(args[0].toLowerCase())) {
-            return Collections.singletonList("reload");
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            out.add("@all"); out.add("@a"); out.add("@s");
+            for (Player p : Bukkit.getOnlinePlayers()) out.add(p.getName());
+            out.removeIf(s -> !s.toLowerCase(Locale.ROOT).startsWith(partial));
+            Collections.sort(out);
+            return out;
+        }
+        if (args.length == 2) {
+            String partial = args[1].toLowerCase(Locale.ROOT);
+            out.addAll(plugin.getBoostDefinitions().keySet());
+            out.removeIf(s -> !s.toLowerCase(Locale.ROOT).startsWith(partial));
+            Collections.sort(out);
+            return out;
+        }
+        if (args.length == 3) {
+            String partial = args[2].toLowerCase(Locale.ROOT);
+            for (String p : Arrays.asList("5m","10m","15m","30m","1h","2h","1d")) {
+                if (p.startsWith(partial)) out.add(p);
+            }
+            return out;
         }
         return Collections.emptyList();
-    }
-
-    private List<String> partial(List<String> options, String token) {
-        String t = token.toLowerCase();
-        List<String> out = new ArrayList<>();
-        for (String o : options) if (o.toLowerCase().startsWith(t)) out.add(o);
-        return out;
-    }
-
-    private String color(String s) {
-        return ChatColor.translateAlternateColorCodes('&', s);
     }
 }
